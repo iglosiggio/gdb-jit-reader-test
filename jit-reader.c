@@ -177,6 +177,9 @@ struct pharo_jit_entry {
   char magic[8];
   uintptr_t code_zone_start;
   uintptr_t code_zone_end;
+  uintptr_t trampoline_return_to_interpreter;
+  uintptr_t trampoline_base_frame_return;
+  uintptr_t trampoline_cannot_return;
 };
 
 size_t register_method(
@@ -283,37 +286,47 @@ enum gdb_status jit_reader_unwind(
   struct gdb_reader_funcs *self,
   struct gdb_unwind_callbacks *cb
 ) {
-  struct gdb_reg_value* bp_reg = cb->reg_get(cb, AMD64_Rbp);
-  struct gdb_reg_value* ip_reg = cb->reg_get(cb, AMD64_Rip);
-  struct pharo_jit_entry* saved_entry = self->priv_data;
-  uintptr_t bp;
-  uintptr_t ip;
   enum gdb_status read_status;
-  char old_bp_buf[sizeof(uintptr_t)];
-  char old_ip_buf[sizeof(uintptr_t)];
-  uintptr_t old_ip;
+  struct pharo_jit_entry* entry = self->priv_data;
 
+  struct gdb_reg_value* ip_reg = cb->reg_get(cb, AMD64_Rip);
+  uintptr_t ip;
+  char old_ip_buf[sizeof(uintptr_t)];
+
+  struct gdb_reg_value* bp_reg = cb->reg_get(cb, AMD64_Rbp);
+  uintptr_t bp;
+  char old_bp_buf[sizeof(uintptr_t)];
+
+
+  ip_reg = cb->reg_get(cb, AMD64_Rip);
+  bp_reg = cb->reg_get(cb, AMD64_Rbp);
   if (bp_reg->size != sizeof(uintptr_t)) goto fail;
   if (ip_reg->size != sizeof(uintptr_t)) goto fail;
 
   bp = 0;
-  ip = 0;
   for (size_t i = 0; i < sizeof(uintptr_t); i++) {
     bp |= ((uintptr_t) bp_reg->value[i]) << (i * 8 /* Assuming 8bit bytes, duh */);
+  }
+
+  ip = 0;
+  for (size_t i = 0; i < sizeof(uintptr_t); i++) {
     ip |= ((uintptr_t) ip_reg->value[i]) << (i * 8 /* Assuming 8bit bytes, duh */);
   }
-  if (ip < saved_entry->code_zone_start || saved_entry->code_zone_end <= ip) goto fail;
+  if (entry->code_zone_start <= ip && ip < entry->code_zone_end) goto jitted_method_unwind;
+  if (ip == entry->trampoline_return_to_interpreter) goto interpreted_method_unwind;
+  if (ip == entry->trampoline_base_frame_return) goto stack_switch_unwind;
+  if (ip == entry->trampoline_cannot_return) goto backtrace_end_unwind;
+fail:
+stack_switch_unwind:
+  ip_reg->free(ip_reg);
+  bp_reg->free(bp_reg);
+  return GDB_FAIL;
 
+jitted_method_unwind:
   read_status = cb->target_read(bp, old_bp_buf, sizeof(old_bp_buf));
   if (read_status != GDB_SUCCESS) goto fail;
   read_status = cb->target_read(bp + sizeof(uintptr_t), old_ip_buf, sizeof(old_ip_buf));
   if (read_status != GDB_SUCCESS) goto fail;
-
-  old_ip = 0;
-  for (size_t i = 0; i < sizeof(uintptr_t); i++) {
-    old_ip |= (((uintptr_t) old_ip_buf[i]) & 0xFF) << (i * 8 /* Assuming 8bit bytes, duh */);
-  }
-  if (old_ip < saved_entry->code_zone_start || saved_entry->code_zone_end <= old_ip) goto fail;
 
   for (size_t i = 0; i < sizeof(uintptr_t); i++) {
     bp_reg->value[i] = old_bp_buf[i];
@@ -324,10 +337,26 @@ enum gdb_status jit_reader_unwind(
   cb->reg_set(cb, AMD64_Rip, ip_reg);
   return GDB_SUCCESS;
 
-fail:
-  ip_reg->free(ip_reg);
-  bp_reg->free(bp_reg);
-  return GDB_FAIL;
+interpreted_method_unwind:
+  read_status = cb->target_read(bp, old_bp_buf, sizeof(old_bp_buf));
+  if (read_status != GDB_SUCCESS) goto fail;
+
+  for (size_t i = 0; i < sizeof(uintptr_t); i++) {
+    bp_reg->value[i] = old_bp_buf[i];
+  }
+
+  cb->reg_set(cb, AMD64_Rbp, bp_reg);
+  cb->reg_set(cb, AMD64_Rip, ip_reg);
+  return GDB_SUCCESS;
+
+backtrace_end_unwind:
+  for (size_t i = 0; i < sizeof(uintptr_t); i++) {
+    bp_reg->value[i] = ip_reg->value[i] = 0;
+  }
+
+  cb->reg_set(cb, AMD64_Rbp, bp_reg);
+  cb->reg_set(cb, AMD64_Rip, ip_reg);
+  return GDB_SUCCESS;
 }
 
 /* Return the frame ID corresponding to the current frame, using C to
