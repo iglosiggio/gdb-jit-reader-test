@@ -248,6 +248,9 @@ enum gdb_status jit_reader_read(
     return GDB_FAIL;
   }
 
+  struct pharo_jit_entry* saved_entry = self->priv_data;
+  *saved_entry = *entry;
+
   struct gdb_object* object = cb->object_open(cb);
   struct gdb_symtab* symtab = cb->symtab_open(cb, object, file_name);
   struct gdb_block* block = cb->block_open(
@@ -268,6 +271,10 @@ enum gdb_status jit_reader_read(
   return GDB_SUCCESS;
 }
 
+constexpr size_t AMD64_Rbp = 6;
+constexpr size_t AMD64_Rsp = 7;
+constexpr size_t AMD64_Rip = 16;
+
 /* Unwind the current frame, CB is the set of unwind callbacks that
    are to be used to do this.
 
@@ -276,6 +283,50 @@ enum gdb_status jit_reader_unwind(
   struct gdb_reader_funcs *self,
   struct gdb_unwind_callbacks *cb
 ) {
+  struct gdb_reg_value* bp_reg = cb->reg_get(cb, AMD64_Rbp);
+  struct gdb_reg_value* ip_reg = cb->reg_get(cb, AMD64_Rip);
+  struct pharo_jit_entry* saved_entry = self->priv_data;
+  uintptr_t bp;
+  uintptr_t ip;
+  enum gdb_status read_status;
+  char old_bp_buf[sizeof(uintptr_t)];
+  char old_ip_buf[sizeof(uintptr_t)];
+  uintptr_t old_ip;
+
+  if (bp_reg->size != sizeof(uintptr_t)) goto fail;
+  if (ip_reg->size != sizeof(uintptr_t)) goto fail;
+
+  bp = 0;
+  ip = 0;
+  for (size_t i = 0; i < sizeof(uintptr_t); i++) {
+    bp |= ((uintptr_t) bp_reg->value[i]) << (i * 8 /* Assuming 8bit bytes, duh */);
+    ip |= ((uintptr_t) ip_reg->value[i]) << (i * 8 /* Assuming 8bit bytes, duh */);
+  }
+  if (ip < saved_entry->code_zone_start || saved_entry->code_zone_end <= ip) goto fail;
+
+  read_status = cb->target_read(bp, old_bp_buf, sizeof(old_bp_buf));
+  if (read_status != GDB_SUCCESS) goto fail;
+  read_status = cb->target_read(bp + sizeof(uintptr_t), old_ip_buf, sizeof(old_ip_buf));
+  if (read_status != GDB_SUCCESS) goto fail;
+
+  old_ip = 0;
+  for (size_t i = 0; i < sizeof(uintptr_t); i++) {
+    old_ip |= (((uintptr_t) old_ip_buf[i]) & 0xFF) << (i * 8 /* Assuming 8bit bytes, duh */);
+  }
+  if (old_ip < saved_entry->code_zone_start || saved_entry->code_zone_end <= old_ip) goto fail;
+
+  for (size_t i = 0; i < sizeof(uintptr_t); i++) {
+    bp_reg->value[i] = old_bp_buf[i];
+    ip_reg->value[i] = old_ip_buf[i];
+  }
+
+  cb->reg_set(cb, AMD64_Rbp, bp_reg);
+  cb->reg_set(cb, AMD64_Rip, ip_reg);
+  return GDB_SUCCESS;
+
+fail:
+  ip_reg->free(ip_reg);
+  bp_reg->free(bp_reg);
   return GDB_FAIL;
 }
 
@@ -286,15 +337,29 @@ struct gdb_frame_id jit_reader_get_frame_id(
   struct gdb_reader_funcs *self,
   struct gdb_unwind_callbacks *cb
 ) {
+  struct gdb_reg_value* bp_reg = cb->reg_get(cb, AMD64_Rbp);
+  struct gdb_reg_value* ip_reg = cb->reg_get(cb, AMD64_Rip);
+  uintptr_t ip;
+  uintptr_t bp;
+  bp = 0;
+  ip = 0;
+  for (size_t i = 0; i < sizeof(uintptr_t); i++) {
+    bp |= ((uintptr_t) bp_reg->value[i]) << (i * 8 /* Assuming 8bit bytes, duh */);
+    ip |= ((uintptr_t) ip_reg->value[i]) << (i * 8 /* Assuming 8bit bytes, duh */);
+  }
+  bp_reg->free(bp_reg);
+  ip_reg->free(ip_reg);
+
   return (struct gdb_frame_id) {
-    .code_address = 0,
-    .stack_address = 0,
+    .code_address = ip,
+    .stack_address = bp,
   };
 }
 
 /* Called when a reader is being unloaded.  This function should also
    free SELF, if required.  */
 void jit_reader_destroy(struct gdb_reader_funcs *self) {
+  free(self->priv_data);
   free(self);
 }
 
@@ -303,10 +368,16 @@ struct gdb_reader_funcs* gdb_init_reader(void) {
   printf("JIT Reader Starting!\n");
 
   struct gdb_reader_funcs* funcs = malloc(sizeof(*funcs));
+  struct pharo_jit_entry* jit_entry = malloc(sizeof(*jit_entry));
+  *jit_entry = (struct pharo_jit_entry) {
+    .code_zone_start = 0,
+    .code_zone_end = 0
+  };
+
   *funcs = (struct gdb_reader_funcs) {
     .reader_version = GDB_READER_INTERFACE_VERSION,
 
-    .priv_data = funcs,
+    .priv_data = jit_entry,
 
     .read = jit_reader_read,
     .unwind = jit_reader_unwind,
